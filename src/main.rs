@@ -32,6 +32,8 @@ fn handle_client(mut stream:TcpStream) {
         .take_while(|line| !line.is_empty()) // Stop at the empty line (end of headers)
         .collect();
 
+    let h_request = http_request.clone();
+
     println!("Entire requst:{:?}",http_request);
 
     let Some(line) = http_request.get(0) else {panic!("Bad request!")};
@@ -40,7 +42,33 @@ fn handle_client(mut stream:TcpStream) {
     let url:Vec<_> = line.split(" ").collect();
     let index:Vec<_> = url[1].split("/").collect();
 
+    println!("Url:{:?} and first: {:?}",url,url[0]);
     println!("index:{:?}",index);
+
+    match url[0] {
+        "GET" => {
+            response = handle_get(h_request);
+        }
+
+        "POST" => {
+            response = handle_post(h_request);
+        }
+
+        _  => {
+            response = "HTTP/1.1 400 INVALID REQUEST\r\n\r\n".to_string();
+        }
+    }
+ 
+    stream.write_all(response.as_bytes()).unwrap();    
+
+}
+
+fn handle_get(http_request:Vec<String>) -> String {
+    let mut response:String = String::from("");
+
+    let Some(line) = http_request.get(0) else {panic!("Bad request!")};
+    let url:Vec<_> = line.split(" ").collect();
+    let index:Vec<_> = url[1].split("/").collect();
 
     match index[1]  {
         "" => {}
@@ -62,6 +90,7 @@ fn handle_client(mut stream:TcpStream) {
             let env_args: Vec<String> = env::args().collect();
             let mut dir = env_args[2].clone();
             dir.push_str(&file_name);
+            println!("Dir: {:?}",dir);
 
             let file = fs::read(dir);
 
@@ -77,7 +106,10 @@ fn handle_client(mut stream:TcpStream) {
         }
         _ => {response = "HTTP/1.1 400 NOT FOUND\r\n\r\n".to_string();}
     }
-    
-    stream.write_all(response.as_bytes()).unwrap();    
 
+    return response;
+}
+
+fn handle_post(http_request:Vec<String>) -> String {
+    todo!("Code");
 }

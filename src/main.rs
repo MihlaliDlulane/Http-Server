@@ -1,7 +1,8 @@
 #[allow(unused_imports)]
 use std::net::{TcpListener,TcpStream};
-use std::io::{Write,BufReader,BufRead};
+use std::io::{Write,BufReader,BufRead,Read};
 use std::{env,fs};
+use std::fs::File;
 
 fn main() {
     
@@ -23,10 +24,11 @@ fn main() {
 
 fn handle_client(mut stream:TcpStream) {
 
-    let mut response = String::from("HTTP/1.1 200 OK\r\n\r\n");
-    let reader = BufReader::new(&stream);
+    let response:String;
+    let mut reader = BufReader::new(&stream);
     
     let http_request: Vec<_> = reader
+        .by_ref()
         .lines()
         .map(|result| result.unwrap())
         .take_while(|line| !line.is_empty()) // Stop at the empty line (end of headers)
@@ -34,8 +36,19 @@ fn handle_client(mut stream:TcpStream) {
 
     let h_request = http_request.clone();
 
-    println!("Entire requst:{:?}",http_request);
+    println!("Header:{:?}",http_request);
 
+    let content_length = http_request.iter().find(|item| item.starts_with("Content-Length"))
+                                            .and_then(|line| line.split(": ").nth(1))
+                                            .and_then(|len| len.parse::<usize>().ok())
+                                            .unwrap_or(0);
+    // Body
+    let mut buffer = vec![0; content_length];
+    if content_length > 0 {
+        reader.read_exact(&mut buffer).unwrap();
+    }
+    let body: &[u8] = &buffer;
+    
     let Some(line) = http_request.get(0) else {panic!("Bad request!")};
     println!("First line of request: {:?}", line);
 
@@ -51,7 +64,7 @@ fn handle_client(mut stream:TcpStream) {
         }
 
         "POST" => {
-            response = handle_post(h_request);
+            response = handle_post(h_request,body);
         }
 
         _  => {
@@ -64,19 +77,21 @@ fn handle_client(mut stream:TcpStream) {
 }
 
 fn handle_get(http_request:Vec<String>) -> String {
-    let mut response:String = String::from("");
+    let response:String;
 
     let Some(line) = http_request.get(0) else {panic!("Bad request!")};
     let url:Vec<_> = line.split(" ").collect();
     let index:Vec<_> = url[1].split("/").collect();
 
     match index[1]  {
-        "" => {}
+        "" => {
+            response = "HTTP/1.1 200 OK\r\n\r\n".to_string();
+        }
         "echo" => {
+            let encoding = http_request.iter().find(|encode| encode.starts_with("Accept-Encoding"));
             let Some(echo) = index.get(2) else {panic!("Need content")};
-            let echo_len = echo.len();
-            let message = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",echo_len,echo);
-            response = message;
+            response = handle_echo(encoding, echo);
+            
         }
         "user-agent" => {
             let user_agent= http_request.iter().find(|item| item.starts_with("User"));
@@ -110,6 +125,47 @@ fn handle_get(http_request:Vec<String>) -> String {
     return response;
 }
 
-fn handle_post(http_request:Vec<String>) -> String {
-    todo!("Code");
+fn handle_post(http_request:Vec<String>,body:&[u8]) -> String {
+    
+    let Some(line) = http_request.get(0) else {panic!("Bad request!")};
+    let url:Vec<_> = line.split(" ").collect();
+    let index:Vec<_> = url[1].split("/").collect();
+
+    let Some(file_name) = index.get(2) else {panic!("Need file name!")};
+    let env_args: Vec<String> = env::args().collect();
+    let mut dir = env_args[2].clone();
+    dir.push_str(&file_name);
+
+    let mut file = File::create(dir).expect("Failed to create file");
+    file.write_all(body).expect("Failed to write to file");
+
+    return "HTTP/1.1 201 Created\r\n\r\n".to_string();
+}
+
+fn handle_echo(encoding:Option<&String>,echo:&&str) -> String {
+
+    let message:String;
+
+    match encoding {
+        None => {
+            let echo_len = echo.len();
+            message = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",echo_len,echo);
+        }
+
+        Some(code) => {
+            let encode_type:Vec<_> = code.split(":").collect();
+            match encode_type[1] {
+                "gzip" => {
+                    let echo_len = echo.len();
+                    message = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n{}",echo_len,"...");
+                }
+                _ => {
+                    message = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n{}","...");
+                }
+            }
+        }
+    }
+
+    
+    return message
 }

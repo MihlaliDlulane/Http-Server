@@ -3,6 +3,7 @@ use std::net::{TcpListener,TcpStream};
 use std::io::{Write,BufReader,BufRead,Read};
 use std::{env,fs};
 use std::fs::File;
+use flate2::{write::GzEncoder,Compression};
 
 fn main() {
     
@@ -50,13 +51,13 @@ fn handle_client(mut stream:TcpStream) {
     let body: &[u8] = &buffer;
     
     let Some(line) = http_request.get(0) else {panic!("Bad request!")};
-    println!("First line of request: {:?}", line);
+    // println!("First line of request: {:?}", line);
 
     let url:Vec<_> = line.split(" ").collect();
-    let index:Vec<_> = url[1].split("/").collect();
+    //let index:Vec<_> = url[1].split("/").collect();
 
-    println!("Url:{:?} and first: {:?}",url,url[0]);
-    println!("index:{:?}",index);
+    // println!("Url:{:?} and first: {:?}",url,url[0]);
+    // println!("index:{:?}",index);
 
     match url[0] {
         "GET" => {
@@ -95,7 +96,7 @@ fn handle_get(http_request:Vec<String>) -> String {
         }
         "user-agent" => {
             let user_agent= http_request.iter().find(|item| item.starts_with("User"));
-            println!("user agent:{:?}",user_agent.unwrap());
+            // println!("user agent:{:?}",user_agent.unwrap());
             let user_agent_vec: Vec<_> = user_agent.unwrap().split(":").collect();
             let message = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",user_agent_vec[1].len(),user_agent_vec[1]);
             response = message;
@@ -105,7 +106,7 @@ fn handle_get(http_request:Vec<String>) -> String {
             let env_args: Vec<String> = env::args().collect();
             let mut dir = env_args[2].clone();
             dir.push_str(&file_name);
-            println!("Dir: {:?}",dir);
+            //println!("Dir: {:?}",dir);
 
             let file = fs::read(dir);
 
@@ -154,10 +155,14 @@ fn handle_echo(encoding:Option<&String>,echo:&&str) -> String {
 
         Some(code) => {
             let encode_type:Vec<_> = code.split(":").collect();
-            match encode_type[1] {
-                "gzip" => {
+            let encode_type:Vec<_> = encode_type[1].split(",").map(|s| s.trim()).collect();
+            let encode_type = encode_type.iter().find(|&&item| item.eq_ignore_ascii_case("gzip"));
+            match encode_type {
+                Some(_result) => {
                     let echo_len = echo.len();
-                    message = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n{}",echo_len,"...");
+                    let mut comp_body = Vec::new();
+                    GzEncoder::new(&mut comp_body,Compression::default()).write_all(echo.as_bytes()).unwrap();
+                    message = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n{:?}",echo_len,comp_body);
                 }
                 _ => {
                     message = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n{}","...");

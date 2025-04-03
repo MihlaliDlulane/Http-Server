@@ -1,40 +1,43 @@
-use std::net::TcpStream;
-use std::io::{Write,BufReader,BufRead,Read};
-use std::{env,fs};
-use std::fs::File;
-use std::collections::HashMap;
-use std::time::Duration;
-use log::info;
+use std::fs;
+use tokio::net::TcpStream;
+use std::path::Path;
+use tokio::io::{BufReader, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use std::error::Error;
-use flate2::{write::GzEncoder,Compression};
+use std::collections::HashMap;
+use async_compression::tokio::write::GzipEncoder;
+use async_trait::async_trait;
 
 #[derive(Debug)]
+
 struct HttpRequest {
-    method:String,
-    path:String,
-    headers: HashMap<String,String>,
-    body:Vec<u8>,
+    method: String,
+    path: String,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
 }
 
+
 #[derive(Debug)]
+
 struct HttpResponse {
     status_code: u16,
     status_text: String,
-    headers:HashMap<String,String>,
-    body:Vec<u8>
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
 }
 
 impl HttpResponse {
-    fn new(status_code:u16) -> Self {
+
+    fn new(status_code: u16) -> Self {
         let status_text = match status_code {
             200 => "OK",
-            400 => "Bad request",
-            404 => "Not found",
+            400 => "Bad Request",
+            404 => "Not Found",
             500 => "Internal Server Error",
             _ => "Unknown",
         }.to_string();
 
-        HttpResponse{
+        HttpResponse {
             status_code,
             status_text,
             headers: HashMap::new(),
@@ -42,76 +45,214 @@ impl HttpResponse {
         }
     }
 
-    fn with_body(mut self,body: Vec<u8>) -> Self{
+
+    fn with_body(mut self, body: Vec<u8>) -> Self {
         self.headers.insert("Content-Length".to_string(), body.len().to_string());
         self.body = body;
         self
     }
 
-    fn with_header(mut self,key:&str,value:&str) -> Self {
+    fn with_header(mut self, key: &str, value: &str) -> Self {
         self.headers.insert(key.to_string(), value.to_string());
         self
     }
 
     fn to_bytes(&self) -> Vec<u8> {
-        let mut respose = Vec::new();
+        let mut response = Vec::new();
+        // Status line
+        response.extend(format!("HTTP/1.1 {} {}\r\n", self.status_code, self.status_text).as_bytes());
 
-        //Status line
-        respose.extend(format!("HTTP/1.1 {} {}\r\n",self.status_code,self.status_text).as_bytes());
-
-        // headers
-        for (key,value) in &self.headers  {
-            respose.extend(format!("{}: {}\r\n",key,value).as_bytes());
+        // Headers
+        for (key, value) in &self.headers {
+            response.extend(format!("{}: {}\r\n", key, value).as_bytes());
         }
 
-        // Emtpy line seperating headers from body
-        respose.extend(b"r\n");
+        // Empty line separating headers from body
+        response.extend(b"\r\n");
 
-        //Body
-        respose.extend(&self.body);
+        // Body
+        response.extend(&self.body);
+        response
+    }
+}
 
-        respose
+
+// Define error types
+#[derive(Debug)]
+enum HandleError{
+    FileNotFound(String),
+    InvalidRequest(String),
+    IoError(std::io::Error),
+    EncodingError(String),
+}
+
+impl From<std::io::Error> for HandleError {
+    fn from(error: std::io::Error) -> Self {
+        HandleError::IoError(error)
+    }
+}
+
+// Handler trait
+#[async_trait]
+trait RequestHandler: Send + Sync {
+    async fn handle(&self,request: &HttpRequest) -> Result<HttpResponse,HandleError>;
+}
+
+// handler implementations
+struct EchoHandler;
+struct UserAgentHandler;
+struct FileHandler{
+    base_dir:String,
+}
+struct RootHandler;
+
+#[async_trait]
+impl RequestHandler for EchoHandler {
+    async fn handle(&self,request: &HttpRequest) -> Result<HttpResponse,HandleError> {
+        let path_segments:Vec<&str> = request.path.split("/").collect();
+        let echo_content = path_segments.get(2)
+                                            .ok_or_else(|| HandleError::InvalidRequest("No echo content provided".to_string()))?;
+
+        // Check for gzip encoding
+        let accepts_gzip = request.headers.get("Accept-Encoding")
+                            .map(|encodings| encodings.to_lowercase().contains("gzip"))
+                            .unwrap_or(false);
+        if accepts_gzip {
+            let mut compressed = Vec::new();
+            let mut encoder = GzipEncoder::new(Vec::new());
+            encoder.write_all(echo_content.as_bytes()).await?;
+            encoder.shutdown().await?;
+            compressed = encoder.into_inner();
+
+            Ok(HttpResponse::new(200)
+                .with_body(compressed)
+                .with_header("Content-Type","text/plain")
+                .with_header("Cotnent-Encoding","gzip"))
+        } else {
+            Ok(HttpResponse::new(200)
+                .with_body(echo_content.as_bytes().to_vec())
+                .with_header("Content-Type","text/plain"))
+        }
+    }
+}
+
+#[async_trait]
+impl  RequestHandler for UserAgentHandler {
+    async fn handle(&self, request: &HttpRequest) -> Result<HttpResponse,HandleError> {
+        let user_agent = request.headers.get("User-Agent")
+            .ok_or_else(|| HandleError::InvalidRequest("No User-Agent header".to_string()))?;
+
+        Ok(HttpResponse::new(200)
+            .with_body(user_agent.as_bytes().to_vec())
+            .with_header("Content-Type","text/plain"))
+    }
+}
+
+#[async_trait]
+impl RequestHandler for FileHandler {
+    async fn handle(&self,request: &HttpRequest) -> Result<HttpResponse,HandleError> {
+        let path_sefments: Vec<&str> = request.path.split("/").collect();
+        let file_name = path_sefments.get(2)
+                .ok_or_else(|| HandleError::InvalidRequest("No filename provided".to_string()))?;
+
+        let file_path = Path::new(&self.base_dir).join(file_name);
+
+        match request.method.as_str() {
+            "GET" => {
+                let content = fs::read(&file_path)
+                .map_err(|_| HandleError::FileNotFound(file_name.to_string()))?;
+
+            Ok(HttpResponse::new(200)
+                .with_body(content)
+                .with_header("Content-Type", "application/octet-stream"))
+            },
+            "POST" => {
+                fs::write(&file_path, &request.body)?;
+
+                Ok(HttpResponse::new(201)
+                    .with_header("Content-Type", "text/plain")
+                    .with_body(b"File created successfully".to_vec()))
+            },
+            _ => {Err(HandleError::InvalidRequest("Method not allowed".to_string()))}
+        }
+    }
+}
+
+#[async_trait]
+impl RequestHandler for RootHandler {
+    async fn handle(&self,_request: &HttpRequest) -> Result<HttpResponse,HandleError> {
+        Ok(HttpResponse::new(200)
+            .with_body(b"Welcome to the server!".to_vec())
+            .with_header("Content-Type", "text/plain"))
+    }
+}
+
+// Main handler function
+pub async fn handle_request(request: HttpRequest) -> HttpResponse {
+
+    let handler: Box<dyn RequestHandler> = match request.path.split('/').nth(1) {
+        Some("echo") => Box::new(EchoHandler),
+        Some("user-agent") => Box::new(UserAgentHandler),
+        Some("files") => Box::new(FileHandler {
+            base_dir: std::env::args().nth(2)
+                .unwrap_or_else(|| "./".to_string())
+        }),
+        Some("") | None => Box::new(RootHandler),
+
+        _ => return HttpResponse::new(404)
+            .with_body(b"Not Found".to_vec())
+            .with_header("Content-Type", "text/plain")
+    };
+
+
+    match handler.handle(&request).await {
+        Ok(response) => response,
+        Err(error) => match error {
+            HandleError::FileNotFound(_) => HttpResponse::new(404)
+                .with_body(b"File not found".to_vec())
+                .with_header("Content-Type", "text/plain"),
+
+            HandleError::InvalidRequest(msg) => HttpResponse::new(400)
+                .with_body(msg.as_bytes().to_vec())
+                .with_header("Content-Type", "text/plain"),
+
+            HandleError::IoError(_) => HttpResponse::new(500)
+                .with_body(b"Internal Server Error".to_vec())
+                .with_header("Content-Type", "text/plain"),
+
+            HandleError::EncodingError(_) => HttpResponse::new(500)
+                .with_body(b"Encoding Error".to_vec())
+                .with_header("Content-Type", "text/plain"),
+
+        }
 
     }
 
 }
 
 
-pub async fn handle_client(mut stream:TcpStream) -> Result<(), Box<dyn Error>>{
+// Usage in main handler
+pub async fn handle_client(stream: TcpStream) -> Result<(), Box<dyn Error>> {
 
-    let peer_addr = stream.peer_addr()?;
-    info!("New connection from {}",peer_addr);
-
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-
-    let mut reader = BufReader::new(&stream);
+    let mut reader = BufReader::new(stream);
     let request = parse_request(&mut reader).await?;
+    let response = handle_request(request).await;
 
-    let response = match request.method.as_str() {
-        "GET" => handle_get(request),
-        "POST" => handle_post(request),
-        _ => HttpResponse::new(400)
-                .with_body(b"Invalid Request".to_vec())
-                .with_header("Content-Type","text/plain"),
-    };
-
-    send_response(&mut stream,response).await?;
-
-    info!("Successfully handled request from {}",peer_addr);
-    Ok(()) 
+    // Get the inner stream back from the reader
+    let mut stream = reader.into_inner();
+    send_response(&mut stream, response).await?;
+    Ok(())
 
 }
 
 
 async fn parse_request(reader: &mut BufReader<TcpStream>) -> Result<HttpRequest, Box<dyn Error>> {
-
     // Read headers
     let mut headers_vec = Vec::new();
     let mut content_length = 0;
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line)?;
+        reader.read_line(&mut line).await?;
         if line == "\r\n" || line == "\n" {
             break;
         }
@@ -146,7 +287,7 @@ async fn parse_request(reader: &mut BufReader<TcpStream>) -> Result<HttpRequest,
     // Read body if present
     let mut body = vec![0; content_length];
     if content_length > 0 {
-        reader.read_exact(&mut body)?;
+        reader.read_exact(&mut body).await?;
     }
 
     Ok(HttpRequest {
@@ -159,110 +300,9 @@ async fn parse_request(reader: &mut BufReader<TcpStream>) -> Result<HttpRequest,
 
 }
 
-
 async fn send_response(stream:&mut TcpStream,response:HttpResponse) -> Result<(), Box<dyn Error>>{
     let response_bytes = response.to_bytes();
-    stream.write_all(&response_bytes)?;
-    stream.flush()?;
+    stream.write_all(&response_bytes).await?;
+    stream.flush().await?;
     Ok(())
-}
-
-
-
-fn handle_get(http_request:Vec<String>) -> String {
-    let response:String;
-
-    let Some(line) = http_request.get(0) else {panic!("Bad request!")};
-    let url:Vec<_> = line.split(" ").collect();
-    let index:Vec<_> = url[1].split("/").collect();
-
-    match index[1]  {
-        "" => {
-            response = "HTTP/1.1 200 OK\r\n\r\n".to_string();
-        }
-        "echo" => {
-            let encoding = http_request.iter().find(|encode| encode.starts_with("Accept-Encoding"));
-            let Some(echo) = index.get(2) else {panic!("Need content")};
-            response = handle_echo(encoding, echo);
-            
-        }
-        "user-agent" => {
-            let user_agent= http_request.iter().find(|item| item.starts_with("User"));
-            // println!("user agent:{:?}",user_agent.unwrap());
-            let user_agent_vec: Vec<_> = user_agent.unwrap().split(":").collect();
-            let message = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",user_agent_vec[1].len(),user_agent_vec[1]);
-            response = message;
-        }
-        "files" => {
-            let Some(file_name) = index.get(2) else {panic!("Need file name!")};
-            let env_args: Vec<String> = env::args().collect();
-            let mut dir = env_args[2].clone();
-            dir.push_str(&file_name);
-            //println!("Dir: {:?}",dir);
-
-            let file = fs::read(dir);
-
-            match file {
-                Ok(content) => {
-                    let message = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",content.len(),String::from_utf8(content).expect("file content"));
-                    response = message;
-                }
-                Err(_e) => {
-                    response = "HTTP/1.1 400 FILE NOT FOUND\r\n\r\n".to_string();
-                }
-            }
-        }
-        _ => {response = "HTTP/1.1 400 NOT FOUND\r\n\r\n".to_string();}
-    }
-
-    return response;
-}
-
-fn handle_post(http_request:Vec<String>,body:&[u8]) -> String {
-    
-    let Some(line) = http_request.get(0) else {panic!("Bad request!")};
-    let url:Vec<_> = line.split(" ").collect();
-    let index:Vec<_> = url[1].split("/").collect();
-
-    let Some(file_name) = index.get(2) else {panic!("Need file name!")};
-    let env_args: Vec<String> = env::args().collect();
-    let mut dir = env_args[2].clone();
-    dir.push_str(&file_name);
-
-    let mut file = File::create(dir).expect("Failed to create file");
-    file.write_all(body).expect("Failed to write to file");
-
-    return "HTTP/1.1 201 Created\r\n\r\n".to_string();
-}
-
-fn handle_echo(encoding:Option<&String>,echo:&&str) -> String {
-
-    let message:String;
-
-    match encoding {
-        None => {
-            let echo_len = echo.len();
-            message = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",echo_len,echo);
-        }
-
-        Some(code) => {
-            let encode_type:Vec<_> = code.split(":").collect();
-            let encode_type:Vec<_> = encode_type[1].split(",").map(|s| s.trim()).collect();
-            let encode_type = encode_type.iter().find(|&&item| item.eq_ignore_ascii_case("gzip"));
-            match encode_type {
-                Some(_result) => {
-                    let echo_len = echo.len();
-                    let mut comp_body = Vec::new();
-                    GzEncoder::new(&mut comp_body,Compression::default()).write_all(echo.as_bytes()).unwrap();
-                    message = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n{:?}",echo_len,comp_body);
-                }
-                _ => {
-                    message = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n{}","...");
-                }
-            }
-        }
-    }
-
-    
-    return message
 }

@@ -1,7 +1,4 @@
-﻿Here's an updated README.md that reflects your improvements and new features:
-
-```markdown
-# Advanced Rust HTTP Server
+# Rust HTTP Server
 
 A robust, async HTTP server built in Rust using Tokio. This server implements HTTP/1.1 with modern features including connection management, graceful shutdown, and comprehensive error handling.
 
